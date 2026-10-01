@@ -1,0 +1,502 @@
+#!/bin/sh
+# CGI-скрипт управления openfortivpn для uhttpd (OpenWrt 25.12.x, busybox ash)
+# Установка: /www/cgi-bin/forti, chmod 755
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+CFG=/etc/forti-ui.conf            # постоянные настройки (флеш), права 600
+RUN=/tmp/forti-ui                 # временные файлы (tmpfs)
+OFV_CONF=$RUN/openfortivpn.conf   # конфиг для openfortivpn с секретами (удаляется после старта)
+RESULT=$RUN/result                # текст последней ошибки подключения
+SINCE=$RUN/since                  # время успешного подключения (unix time)
+NOTICE=$RUN/notice                # одноразовое информационное сообщение
+INST_RUN=$RUN/install.run         # существует, пока идёт установка пакета
+INST_RC=$RUN/install.rc           # код завершения установки
+INST_LOG=$RUN/install.log         # вывод установки
+
+IFNAME=forti0
+NET_NAME=forti                    # имя интерфейса в /etc/config/network
+ZONE_NAME=forti                   # имя создаваемой зоны файрвола
+LAN_ZONE=lan                      # откуда разрешаем forwarding
+WAIT=40                           # сколько секунд ждать подключения (< script_timeout uhttpd = 60)
+
+umask 077
+mkdir -p "$RUN"
+
+# ---------- вспомогательные функции ----------
+
+esc() {
+	printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+		-e 's/"/\&quot;/g' -e "s/'/\&#39;/g"
+}
+
+cfg_get() { [ -r "$CFG" ] && sed -n "s/^$1=//p" "$CFG" | head -n 1; }
+cfg_has() { [ -r "$CFG" ] && grep -q "^$1=" "$CFG"; }
+
+urldecode() {
+	printf '%b' "$(printf '%s' "$1" | sed -e 's/+/ /g' -e 's/\\/\\\\/g' \
+		-e 's/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g')"
+}
+
+have_ofv()   { command -v openfortivpn >/dev/null 2>&1; }
+is_running() { pidof openfortivpn >/dev/null 2>&1; }
+has_ip()     { ip -4 -o addr show dev "$IFNAME" 2>/dev/null | grep -q inet; }
+
+# Журнал текущей попытки подключения (с последней метки forti-ui)
+show_log() {
+	logread 2>/dev/null | awk '
+		/forti-ui: connect attempt/ { n = NR }
+		{ l[NR] = $0 }
+		END {
+			if (!n) n = 1
+			for (i = n; i <= NR; i++)
+				if (l[i] ~ /openfortivpn|pppd|forti-ui|ppp/) print l[i]
+		}' | tail -n 80
+}
+
+parse_post() {
+	local len="${CONTENT_LENGTH:-0}" body kv k v oIFS="$IFS"
+	case $len in ''|*[!0-9]*) len=0 ;; esac
+	[ "$len" -gt 8192 ] && len=8192
+	body=$(head -c "$len")
+	set -f
+	IFS='&'
+	for kv in $body; do
+		k=${kv%%=*}
+		v=${kv#*=}
+		v=$(urldecode "$v" | tr -d '\r\n')
+		case $k in
+			action)    F_ACTION=$v ;;
+			server)    F_SERVER=$(printf '%s' "$v" | tr -d ' \t') ;;
+			port)      F_PORT=$(printf '%s' "$v" | tr -d ' \t') ;;
+			cert)      F_CERT=$v ;;
+			user)      F_USER=$v ;;
+			pass)      F_PASS=$v ;;
+			otp)       F_OTP=$(printf '%s' "$v" | tr -d ' \t') ;;
+			save_user) F_SAVE_USER=1 ;;
+			save_pass) F_SAVE_PASS=1 ;;
+		esac
+	done
+	IFS="$oIFS"
+	set +f
+}
+
+validate() {
+	case $F_SERVER in ''|*[!A-Za-z0-9.-]*) ERR="Некорректное имя сервера"; return 1 ;; esac
+	case $F_PORT in ''|*[!0-9]*) ERR="Некорректный порт"; return 1 ;; esac
+	if [ "$F_PORT" -lt 1 ] || [ "$F_PORT" -gt 65535 ]; then ERR="Порт должен быть в диапазоне 1–65535"; return 1; fi
+
+	F_CERT=$(printf '%s' "$F_CERT" | tr -d ': \t' | tr 'A-F' 'a-f')
+	if [ -n "$F_CERT" ]; then
+		case $F_CERT in *[!0-9a-f]*) ERR="Отпечаток сертификата должен быть в hex (SHA-256)"; return 1 ;; esac
+		[ ${#F_CERT} -eq 64 ] || { ERR="Отпечаток SHA-256 должен содержать 64 hex-символа"; return 1; }
+	fi
+
+	[ -n "$F_USER" ] || F_USER=$(cfg_get USER)
+	[ -n "$F_USER" ] || { ERR="Не указано имя пользователя"; return 1; }
+	[ -n "$F_PASS" ] || F_PASS=$(cfg_get PASS)
+	[ -n "$F_PASS" ] || { ERR="Не указан пароль"; return 1; }
+	case $F_OTP in *[!A-Za-z0-9]*) ERR="Некорректный OTP"; return 1 ;; esac
+	return 0
+}
+
+save_cfg() {
+	local tmp="$RUN/cfg.new"
+	{
+		echo "SERVER=$F_SERVER"
+		echo "PORT=$F_PORT"
+		echo "CERT=$F_CERT"
+		[ "$F_SAVE_USER" = 1 ] && echo "USER=$F_USER"
+		[ "$F_SAVE_PASS" = 1 ] && echo "PASS=$F_PASS"
+	} > "$tmp"
+	# пишем во флеш только при изменениях
+	if [ "$(cat "$CFG" 2>/dev/null)" != "$(cat "$tmp")" ]; then
+		cat "$tmp" > "$CFG"
+		chmod 600 "$CFG"
+	fi
+	rm -f "$tmp"
+}
+
+# ---------- подключение / отключение ----------
+
+do_connect() {
+	is_running && return
+	rm -f "$RESULT" "$SINCE"
+
+	if ! have_ofv; then
+		echo "Пакет openfortivpn не установлен" > "$RESULT"
+		return
+	fi
+	if ! validate; then
+		echo "$ERR" > "$RESULT"
+		return
+	fi
+	save_cfg
+
+	logger -t forti-ui "connect attempt"
+
+	# секреты передаём через конфиг-файл (права 600), а не через аргументы командной строки
+	{
+		echo "host = $F_SERVER"
+		echo "port = $F_PORT"
+		echo "username = $F_USER"
+		echo "password = $F_PASS"
+		[ -n "$F_OTP" ] && echo "otp = $F_OTP"
+		[ -n "$F_CERT" ] && echo "trusted-cert = $F_CERT"
+	} > "$OFV_CONF"
+	chmod 600 "$OFV_CONF"
+
+	( openfortivpn -c "$OFV_CONF" --pppd-ifname="$IFNAME" --pppd-no-peerdns \
+		--no-dns --use-syslog >/dev/null 2>&1 </dev/null & )
+
+	local i=0 ok=0
+	while [ "$i" -lt "$WAIT" ]; do
+		sleep 1
+		i=$((i + 1))
+		is_running || break
+		if has_ip; then ok=1; break; fi
+	done
+
+	if [ "$ok" = 1 ]; then
+		sleep 1
+		date +%s > "$SINCE"
+		logger -t forti-ui "connected"
+	else
+		if is_running; then
+			echo "Таймаут подключения (${WAIT} с)" > "$RESULT"
+			kill $(pidof openfortivpn) 2>/dev/null
+		else
+			echo "Не удалось подключиться: процесс openfortivpn завершился" > "$RESULT"
+		fi
+		sleep 1
+	fi
+	rm -f "$OFV_CONF"
+}
+
+do_disconnect() {
+	local i=0
+	is_running && kill $(pidof openfortivpn) 2>/dev/null
+	while is_running && [ "$i" -lt 10 ]; do sleep 1; i=$((i + 1)); done
+	is_running && kill -9 $(pidof openfortivpn) 2>/dev/null
+	rm -f "$RESULT" "$SINCE" "$OFV_CONF"
+	logger -t forti-ui "disconnected"
+}
+
+# ---------- установка openfortivpn ----------
+
+do_install() {
+	have_ofv && return
+	[ -f "$INST_RUN" ] && return
+	rm -f "$INST_RC" "$INST_LOG"
+	: > "$INST_RUN"
+	# выполняем в фоне: установка может занять больше, чем script_timeout uhttpd
+	(
+		if command -v apk >/dev/null 2>&1; then
+			apk update && apk add openfortivpn
+		else
+			opkg update && opkg install openfortivpn
+		fi
+		echo $? > "$INST_RC"
+		rm -f "$INST_RUN"
+	) >"$INST_LOG" 2>&1 </dev/null &
+}
+
+# ---------- интерфейс forti и зона файрвола ----------
+
+# имя зоны, в состав которой входит сеть forti
+forti_zone_name() {
+	local i=0
+	while uci -q get "firewall.@zone[$i]" >/dev/null; do
+		case " $(uci -q get "firewall.@zone[$i].network") " in
+			*" $NET_NAME "*) uci -q get "firewall.@zone[$i].name"; return 0 ;;
+		esac
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# ссылка вида @zone[N] на зону с заданным именем
+zone_ref_by_name() {
+	local i=0
+	while uci -q get "firewall.@zone[$i]" >/dev/null; do
+		if [ "$(uci -q get "firewall.@zone[$i].name")" = "$1" ]; then
+			echo "@zone[$i]"
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	return 1
+}
+
+has_forwarding() {
+	local i=0
+	while uci -q get "firewall.@forwarding[$i]" >/dev/null; do
+		if [ "$(uci -q get "firewall.@forwarding[$i].src")" = "$1" ] &&
+		   [ "$(uci -q get "firewall.@forwarding[$i].dest")" = "$2" ]; then
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# Заполняет NEED_IF / NEED_ZONE / NEED_FWD и ZONE (имя зоны для forwarding)
+check_setup() {
+	NEED_IF=0; NEED_ZONE=0; NEED_FWD=0
+	uci -q get "network.$NET_NAME" >/dev/null || NEED_IF=1
+	ZONE=$(forti_zone_name) || { NEED_ZONE=1; ZONE=$ZONE_NAME; }
+	has_forwarding "$LAN_ZONE" "$ZONE" || NEED_FWD=1
+}
+
+do_setup() {
+	local id ref
+	check_setup
+
+	if [ "$NEED_IF" = 1 ]; then
+		uci set "network.$NET_NAME=interface"
+		uci set "network.$NET_NAME.proto=none"
+		uci set "network.$NET_NAME.device=$IFNAME"
+		uci set "network.$NET_NAME.defaultroute=0"
+	fi
+
+	if [ "$NEED_ZONE" = 1 ]; then
+		ref=$(zone_ref_by_name "$ZONE_NAME")
+		if [ -n "$ref" ]; then
+			# зона с таким именем уже есть — просто добавляем в неё сеть
+			uci add_list "firewall.$ref.network=$NET_NAME"
+		else
+			id=$(uci add firewall zone)
+			uci set "firewall.$id.name=$ZONE_NAME"
+			uci set "firewall.$id.input=REJECT"
+			uci set "firewall.$id.output=ACCEPT"
+			uci set "firewall.$id.forward=REJECT"
+			uci set "firewall.$id.masq=1"
+			uci add_list "firewall.$id.network=$NET_NAME"
+		fi
+	fi
+
+	if [ "$NEED_FWD" = 1 ]; then
+		id=$(uci add firewall forwarding)
+		uci set "firewall.$id.src=$LAN_ZONE"
+		uci set "firewall.$id.dest=$ZONE"
+	fi
+
+	if uci commit network && uci commit firewall; then
+		# применяем в фоне, чтобы не держать HTTP-запрос
+		( /etc/init.d/network reload; /etc/init.d/firewall reload ) >/dev/null 2>&1 </dev/null &
+		echo "Интерфейс и зона файрвола созданы, настройки применяются." > "$NOTICE"
+	else
+		uci revert network; uci revert firewall
+		echo "Не удалось сохранить настройки network/firewall" > "$RESULT"
+	fi
+}
+
+# ---------- обработка POST ----------
+
+if [ "$REQUEST_METHOD" = "POST" ]; then
+	# простая защита от CSRF: Origin должен совпадать с Host
+	if [ -n "$HTTP_ORIGIN" ]; then
+		case $HTTP_ORIGIN in
+			*"://$HTTP_HOST") ;;
+			*) printf 'Status: 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nForbidden\n'; exit 0 ;;
+		esac
+	fi
+	parse_post
+	case $F_ACTION in
+		connect)    do_connect ;;
+		disconnect) do_disconnect ;;
+		install)    do_install ;;
+		setup)      is_running || do_setup ;;
+	esac
+	printf 'Status: 303 See Other\r\nLocation: %s\r\n\r\n' "${SCRIPT_NAME:-/cgi-bin/forti}"
+	exit 0
+fi
+
+# ---------- отображение страницы ----------
+
+if is_running; then
+	if has_ip; then STATE=up; else STATE=connecting; fi
+else
+	STATE=down
+fi
+
+if [ -f "$INST_RUN" ]; then INST=running
+elif have_ofv; then INST=ok
+else INST=missing
+fi
+
+S_SERVER=$(cfg_get SERVER)
+S_PORT=$(cfg_get PORT); [ -n "$S_PORT" ] || S_PORT=443
+S_CERT=$(cfg_get CERT)
+S_USER=$(cfg_get USER)
+S_PASS=$(cfg_get PASS)
+
+CHK_USER=""; cfg_has USER && CHK_USER="checked"
+CHK_PASS=""; cfg_has PASS && CHK_PASS="checked"
+PASS_PH="пароль"; [ -n "$S_PASS" ] && PASS_PH="••••••• (сохранён)"
+
+LOCK=""
+{ [ "$STATE" != down ] || [ "$INST" != ok ]; } && LOCK="disabled"
+REFRESH=""
+{ [ "$STATE" = connecting ] || [ "$INST" = running ]; } && REFRESH='<meta http-equiv="refresh" content="3">'
+
+# --- одноразовое уведомление ---
+NOTICE_HTML=""
+if [ -s "$NOTICE" ]; then
+	NOTICE_HTML="<div class=\"status ok\">$(esc "$(cat "$NOTICE")")</div>"
+	rm -f "$NOTICE"
+fi
+
+# --- статус подключения и журнал ---
+STATUS_HTML=""
+LOG_HTML=""
+case $STATE in
+	up)
+		IP=$(ip -4 -o addr show dev "$IFNAME" 2>/dev/null | awk '{print $4; exit}')
+		SINCE_TXT=""
+		[ -r "$SINCE" ] && SINCE_TXT=$(date -d "@$(cat "$SINCE")" '+%d.%m.%Y %H:%M:%S' 2>/dev/null)
+		STATUS_HTML="<div class=\"status ok\"><b>🟢 Подключено</b><br>Сервер: $(esc "$S_SERVER"):$(esc "$S_PORT")<br>Интерфейс: $IFNAME, адрес: $(esc "$IP")"
+		[ -n "$SINCE_TXT" ] && STATUS_HTML="$STATUS_HTML<br>С: $(esc "$SINCE_TXT")"
+		STATUS_HTML="$STATUS_HTML</div>"
+		LOG_HTML="<details><summary>Журнал</summary><pre>$(esc "$(show_log)")</pre></details>"
+		;;
+	connecting)
+		STATUS_HTML='<div class="status warn"><b>🟡 Выполняется подключение…</b> страница обновится автоматически</div>'
+		LOG_HTML="<details open><summary>Журнал</summary><pre>$(esc "$(show_log)")</pre></details>"
+		;;
+	down)
+		if [ -s "$RESULT" ]; then
+			STATUS_HTML="<div class=\"status err\"><b>🔴 Ошибка:</b> $(esc "$(cat "$RESULT")")</div>"
+			# журнал имеет смысл, только если попытка реально запускалась
+			case $(cat "$RESULT") in
+				Не\ удалось\ подключиться*|Таймаут*)
+					LOG_HTML="<h2>Журнал подключения</h2><pre>$(esc "$(show_log)")</pre>" ;;
+			esac
+		else
+			STATUS_HTML='<div class="status off">⚪ Не подключено</div>'
+		fi
+		;;
+esac
+
+# --- установка openfortivpn ---
+PKG_HTML=""
+case $INST in
+	running)
+		PKG_HTML="<div class=\"status warn\"><b>Устанавливается openfortivpn…</b> страница обновится автоматически</div><pre>$(esc "$(tail -n 40 "$INST_LOG" 2>/dev/null)")</pre>"
+		;;
+	missing)
+		PKG_HTML='<div class="status warn"><b>Пакет openfortivpn не установлен.</b> Установить его сейчас? Роутеру нужен доступ в интернет.'
+		PKG_HTML="$PKG_HTML<form method=\"post\"><input type=\"hidden\" name=\"action\" value=\"install\"><button type=\"submit\">Установить openfortivpn</button></form></div>"
+		if [ -s "$INST_RC" ] && [ "$(cat "$INST_RC")" != 0 ]; then
+			PKG_HTML="$PKG_HTML<div class=\"status err\"><b>Установка не удалась</b> (код $(esc "$(cat "$INST_RC")"))</div><pre>$(esc "$(tail -n 40 "$INST_LOG" 2>/dev/null)")</pre>"
+		fi
+		;;
+	ok)
+		if [ -s "$INST_RC" ]; then
+			[ "$(cat "$INST_RC")" = 0 ] && NOTICE_HTML="$NOTICE_HTML<div class=\"status ok\">Пакет openfortivpn установлен.</div>"
+			rm -f "$INST_RC" "$INST_LOG"
+		fi
+		;;
+esac
+
+# --- интерфейс и зона файрвола ---
+SETUP_HTML=""
+if [ "$STATE" = down ] && [ "$INST" != running ]; then
+	check_setup
+	if [ $((NEED_IF + NEED_ZONE + NEED_FWD)) -gt 0 ]; then
+		ITEMS=""
+		[ "$NEED_IF" = 1 ] && ITEMS="$ITEMS<li>интерфейс <code>$NET_NAME</code>: proto <code>none</code>, device <code>$IFNAME</code>, defaultroute <code>0</code></li>"
+		[ "$NEED_ZONE" = 1 ] && ITEMS="$ITEMS<li>зона файрвола <code>$(esc "$ZONE")</code> (input REJECT, output ACCEPT, forward REJECT, masq) с сетью <code>$NET_NAME</code></li>"
+		[ "$NEED_FWD" = 1 ] && ITEMS="$ITEMS<li>forwarding <code>$LAN_ZONE</code> → <code>$(esc "$ZONE")</code></li>"
+		SETUP_HTML="<div class=\"status warn\"><b>Сеть для VPN не настроена.</b> Создать на роутере:<ul>$ITEMS</ul>"
+		SETUP_HTML="$SETUP_HTML<form method=\"post\"><input type=\"hidden\" name=\"action\" value=\"setup\"><button type=\"submit\">Создать и применить</button></form></div>"
+	fi
+fi
+
+printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+
+cat <<EOF
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+$REFRESH
+<title>FortiVPN</title>
+<style>
+:root { color-scheme: light dark; }
+body { font: 15px/1.4 system-ui, sans-serif; max-width: 520px; margin: 2em auto; padding: 0 1em; }
+h1 { font-size: 1.4em; } h2 { font-size: 1.1em; }
+label { display: block; margin: .8em 0 .2em; }
+input[type=text], input[type=password], input[type=number] { width: 100%; box-sizing: border-box; padding: .5em; font: inherit; }
+input[type=checkbox] { margin-right: .4em; }
+.row { display: flex; gap: .8em; align-items: center; }
+.row input[type=text], .row input[type=password] { flex: 1; min-width: 0; }
+.chk { display: flex; align-items: center; margin: 0; white-space: nowrap; }
+button { padding: .6em 1.4em; font: inherit; cursor: pointer; margin-top: .5em; }
+.status { padding: .8em 1em; border-radius: 6px; margin: 1em 0; }
+.status form { margin: 0; }
+.status ul { margin: .4em 0; padding-left: 1.4em; }
+.ok { background: #1b7f3a33; border: 1px solid #1b7f3a; }
+.err { background: #c0222233; border: 1px solid #c02222; }
+.warn { background: #d9a40033; border: 1px solid #d9a400; }
+.off { background: #8884; border: 1px solid #888; }
+pre { font-size: 12px; overflow-x: auto; background: #8882; padding: .6em; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<h1>🌐 FortiVPN</h1>
+$NOTICE_HTML
+$STATUS_HTML
+$PKG_HTML
+$SETUP_HTML
+
+<form method="post" autocomplete="off" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Подключение…'">
+<input type="hidden" name="action" value="connect">
+
+<label for="server">Имя сервера</label>
+<input type="text" id="server" name="server" value="$(esc "$S_SERVER")" placeholder="vpn.example.com" required $LOCK>
+
+<label for="port">Порт</label>
+<input type="number" id="port" name="port" value="$(esc "$S_PORT")" min="1" max="65535" required $LOCK>
+
+<label for="cert">Отпечаток доверенного сертификата (SHA-256)</label>
+<input type="text" id="cert" name="cert" value="$(esc "$S_CERT")" placeholder="64 hex-символа" $LOCK>
+
+<label for="user">Имя пользователя</label>
+<div class="row">
+<input type="text" id="user" name="user" value="$(esc "$S_USER")" required $LOCK>
+<label class="chk"><input type="checkbox" name="save_user" value="1" $CHK_USER $LOCK>Сохранить</label>
+</div>
+
+<label for="pass">Пароль</label>
+<div class="row">
+<input type="password" id="pass" name="pass" placeholder="$(esc "$PASS_PH")" autocomplete="new-password" $LOCK>
+<label class="chk"><input type="checkbox" name="save_pass" value="1" $CHK_PASS $LOCK>Сохранить</label>
+</div>
+
+<label for="otp">Одноразовый код OTP (необязательно)</label>
+<input type="text" id="otp" name="otp" inputmode="numeric" placeholder="одноразовый код" autocomplete="off" $LOCK>
+
+EOF
+
+if [ "$STATE" = down ] && [ "$INST" = ok ]; then
+	echo '<button type="submit">Подключить</button>'
+fi
+
+echo '</form>'
+
+if [ "$STATE" != down ]; then
+	cat <<EOF
+<form method="post">
+<input type="hidden" name="action" value="disconnect">
+<button type="submit">Отключить</button>
+</form>
+EOF
+fi
+
+cat <<EOF
+$LOG_HTML
+</body>
+</html>
+EOF
