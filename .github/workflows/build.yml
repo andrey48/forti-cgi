@@ -161,7 +161,7 @@ jobs:
             --volume "${GITHUB_WORKSPACE}:/src:ro" \
             --volume "${RUNNER_TEMP}/forti-signing:/signing:ro" \
             --volume "${RUNNER_TEMP}/apk-output:/output" \
-            --workdir /tmp/build \
+            --workdir /tmp \
             --env VERSION="${VERSION}" \
             --env PKG_NAME="${PKG_NAME}" \
             --env PKG_RELEASE="${PKG_RELEASE}" \
@@ -177,12 +177,12 @@ jobs:
               test -f /signing/forti-cgi.sec
 
               mkdir -p \
-                /tmp/build/package-root/www/cgi-bin
+                /tmp/package-root/www/cgi-bin
 
               install \
                 -m 0755 \
                 /src/files/www/cgi-bin/forti \
-                /tmp/build/package-root/www/cgi-bin/forti
+                /tmp/package-root/www/cgi-bin/forti
 
               APK_FILE="/output/${PKG_NAME}-${VERSION}-r${PKG_RELEASE}.apk"
 
@@ -193,7 +193,7 @@ jobs:
                 --info "description:Forti CGI script for OpenWrt" \
                 --info "maintainer:forti-cgi" \
                 --info "depends:openfortivpn" \
-                --files /tmp/build/package-root \
+                --files /tmp/package-root \
                 --output "$APK_FILE"
 
               test -s "$APK_FILE"
