@@ -1,0 +1,56 @@
+name: Build and publish forti apk package
+
+on:
+  workflow_dispatch:
+#  push:
+#    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: sudo apt update && sudo apt install -y zstd
+
+      - name: Download OpenWrt SDK 25.x
+        run: |
+          wget -q https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/openwrt-sdk-25.12.5-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+          tar --zstd -xf openwrt-sdk-*.tar.zst
+          mv openwrt-sdk-* sdk
+
+      - name: Copy package into SDK
+        run: |
+          mkdir -p sdk/package/forti-cgi
+          cp Makefile sdk/package/forti-cgi/
+          cp -r files sdk/package/forti-cgi/
+
+      - name: Build
+        run: |
+          cd sdk
+          make defconfig
+          make package/forti-cgi/compile V=s
+
+      - name: Collect .apk
+        run: |
+          mkdir -p output
+          find sdk/bin -name "forti-cgi-*.apk" -exec cp {} output/ \;
+
+      - name: Create signed index
+        run: |
+          cd output
+          echo "${{ secrets.FORTI_FEED_KEY }}" > forti-cgi-feed.pem
+          ../sdk/staging_dir/host/bin/apk mkndx \
+            --keys-dir . \
+            --sign forti-cgi-feed.pem \
+            --output packages.adb \
+            *.apk
+          # публичный ключ из репозитория
+          cp ../forti-cgi-feed.pub.pem .
+          rm forti-cgi-feed.pem
+
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: output
