@@ -156,6 +156,7 @@ jobs:
           docker pull "${OPENWRT_SDK_IMAGE}"
 
           mkdir -p "$RUNNER_TEMP/apk-output"
+          chmod 777 "$RUNNER_TEMP/apk-output"
 
           docker run --rm \
             --volume "${GITHUB_WORKSPACE}:/src:ro" \
