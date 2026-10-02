@@ -158,7 +158,6 @@ jobs:
           mkdir -p "$RUNNER_TEMP/apk-output"
 
           docker run --rm \
-            --read-only \
             --volume "${GITHUB_WORKSPACE}:/src:ro" \
             --volume "${RUNNER_TEMP}/forti-signing:/signing:ro" \
             --volume "${RUNNER_TEMP}/apk-output:/output" \
@@ -246,7 +245,6 @@ jobs:
             "$RUNNER_TEMP/feed-work/forti-cgi.sec"
 
           docker run --rm \
-            --read-only \
             --volume "${RUNNER_TEMP}/feed:/feed" \
             --volume "${RUNNER_TEMP}/feed-work:/work" \
             --workdir /work \
