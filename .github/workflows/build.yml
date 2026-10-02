@@ -94,6 +94,8 @@ jobs:
       # Persistent feed
       # ------------------------------------------------------------
       - name: Checkout gh-pages feed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -117,6 +119,9 @@ jobs:
             git -C "$RUNNER_TEMP/feed" init
             git -C "$RUNNER_TEMP/feed" checkout --orphan gh-pages
 
+            git -C "$RUNNER_TEMP/feed" remote add origin \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
             git -C "$RUNNER_TEMP/feed" config \
               user.name \
               "github-actions[bot]"
@@ -128,7 +133,6 @@ jobs:
 
           touch "$RUNNER_TEMP/feed/.nojekyll"
 
-          # Never retain private keys in Pages.
           rm -f "$RUNNER_TEMP/feed"/*.sec
           rm -f "$RUNNER_TEMP/feed"/*.key
 
