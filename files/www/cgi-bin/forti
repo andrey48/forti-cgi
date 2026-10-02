@@ -421,6 +421,8 @@ cat <<EOF
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/luci-static/bootstrap/logo_48.png" sizes="48x48">
+<link rel="icon" href="/luci-static/bootstrap/logo.svg" sizes="any">
 $REFRESH
 <title>FortiVPN</title>
 <style>
