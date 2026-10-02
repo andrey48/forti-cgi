@@ -238,6 +238,8 @@ jobs:
 
           mkdir -p "$RUNNER_TEMP/feed-work"
 
+          chmod 777 "$RUNNER_TEMP/feed"
+
           cp \
             "$RUNNER_TEMP/forti-signing/forti-cgi.sec" \
             "$RUNNER_TEMP/feed-work/forti-cgi.sec"
