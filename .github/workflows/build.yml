@@ -242,7 +242,7 @@ jobs:
             "$RUNNER_TEMP/forti-signing/forti-cgi.sec" \
             "$RUNNER_TEMP/feed-work/forti-cgi.sec"
 
-          chmod 600 \
+          chmod 644 \
             "$RUNNER_TEMP/feed-work/forti-cgi.sec"
 
           docker run --rm \
