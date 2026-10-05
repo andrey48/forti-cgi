@@ -1,22 +1,22 @@
-# **CGI script to interact with openfortivpn via web interface.**
+# **CGI-скрипт управления openfortivpn для uhttpd (OpenWrt 25.12.x, busybox ash)**
 
-## **Install:**
+## **Установка:**
 
-1. Add repo key
+1. Добавление ключа репозитория:
    ```
    mkdir -p /etc/apk/keys
    wget -O /etc/apk/keys/forti-cgi.pub https://andrey48.github.io/forti-cgi/forti-cgi.pub
    ```
 
-3. Add repo to custom feeds:
+3. Добавление репозитория:
    ```
    echo "https://andrey48.github.io/forti-cgi/packages.adb" >> /etc/apk/repositories.d/customfeeds.list
    ```
 
-5. Install package:
+5. Установка пакета:
    ```
    apk update && apk add forti
    ```
 
-## **Access:**
+## **Доступ:**
 `http://<router_ip>/cgi-bin/forti`
