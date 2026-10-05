@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKGARCH:=all
 
 PKG_LICENSE:=MIT
-PKG_MAINTAINER:=andrey48 <andrey48@gmail.com>
+PKG_MAINTAINER:=andrey48 <>
 
 include $(INCLUDE_DIR)/package.mk
 
