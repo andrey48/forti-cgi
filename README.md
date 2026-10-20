@@ -15,7 +15,7 @@
 
 5. Установка пакета:
    ```
-   apk update && apk add forti
+   apk update && apk add forti-cgi
    ```
 
 ## **Доступ:**
